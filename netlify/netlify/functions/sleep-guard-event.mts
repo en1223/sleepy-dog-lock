@@ -325,12 +325,11 @@ export async function handle(request: Request, dependencies: Dependencies): Prom
   }
 
   const copy = barkCopy(event, transition, appName);
-  if (copy) {
-    const barkKey = Netlify.env.get("BARK_DEVICE_KEY");
+  const barkKey = Netlify.env.get("BARK_DEVICE_KEY");
+  if (copy && barkKey) {
     const barkOrigin = Netlify.env.get("BARK_API_ORIGIN") ?? "https://api.day.app";
     const barkIcon = Netlify.env.get("BARK_ICON_URL")
       ?? new URL("/assets/c-avatar-v4.png", request.url).href;
-    if (!barkKey) return json(503, { ok: false, error: "bark_not_configured" });
 
     const url = new URL(`${barkOrigin.replace(/\/$/, "")}/push`);
     let barkResponse: Response;

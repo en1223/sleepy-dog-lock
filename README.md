@@ -46,9 +46,9 @@ flowchart LR
 | TimeBack: Take Back Your Time | 提供 iOS 系统 Shield，真正挡住指定 App |
 | [iPhone 快捷指令](v0.2-shortcuts/INSTALL.md) | 发送晚安、App 打开和起床事件，并在偷开时锁屏 |
 | [Netlify 事件服务](netlify/README.md) | 保存睡眠状态与次数，先记录证据再发送 Bark |
-| ChatGPT MCP（可选） | 让对话中的“晚安”直接开启守卫，首次连接需在 Bark 中确认授权 |
+| ChatGPT MCP（可选） | 让对话中的“晚安”直接记录睡眠状态，首次连接在浏览器输入私有授权密码 |
 
-Bark 只负责回执与追责，不承担拦截。真正挡住 App 的是 TimeBack Shield；即使 Bark 推送失败，服务器中已经写入的事件也不会消失。
+Bark 只负责回执与追责，不承担拦截。真正挡住 App 的是 TimeBack Shield；即使未配置 Bark，服务器与 ChatGPT MCP 仍可单独记录和查询睡眠状态。
 
 ## 快速开始
 
@@ -56,7 +56,7 @@ Bark 只负责回执与追责，不承担拦截。真正挡住 App 的是 TimeBa
 2. 在 TimeBack 中创建并启用一条名为 `Sleepy Dog Lock` 的规则，选择需要拦截的娱乐 App。
 3. 按 [快捷指令安装说明](v0.2-shortcuts/INSTALL.md) 创建晚安、偷开和起床三个事件。
 4. 先只用一个 App 完成开启、连续偷开三次、结束会话的验收，再扩大 App 范围。
-5. 如需由 ChatGPT 接管晚安触发，将 `https://<site>.netlify.app/mcp` 连接为 MCP，并从 Bark 点按一次授权链接。
+5. 如需由 ChatGPT 接管晚安触发，将 `https://<site>.netlify.app/mcp` 连接为 MCP，并在浏览器授权页输入 Netlify 中的 `MCP_APPROVAL_PASSWORD`。
 
 不要把电话、信息、地图、支付、医疗或其他紧急 App 加入拦截列表。
 
@@ -105,7 +105,7 @@ scripts/         自动验证与头像构建脚本
 npm run verify
 ```
 
-验证覆盖事件校验、会话开始与结束、重复开启、过期状态、三档偷开次数、并发写入、Bark 失败留证、OAuth 2.1 PKCE、一次性授权码、MCP 鉴权与工具调用。
+验证覆盖事件校验、会话开始与结束、重复开启、过期状态、三档偷开次数、并发写入、可选 Bark、密码授权、OAuth 2.1 PKCE、一次性授权码、资源绑定、MCP 鉴权与工具调用。
 
 原生 iOS 部分的通过仅代表源码结构和配置文件通过静态检查，不等同于真机可用。
 
@@ -113,6 +113,7 @@ npm run verify
 
 - `BARK_DEVICE_KEY` 只放在 Netlify 环境变量中，绝不进入快捷指令、Swift 源码或 GitHub；
 - `SLEEP_GUARD_SHORTCUT_TOKEN` 只存在于 Netlify 和使用者自己的 iPhone 请求头中；
+- `MCP_APPROVAL_PASSWORD` 只存在于 Netlify 环境变量中，不写入仓库或 OAuth 令牌；
 - ChatGPT MCP 使用独立 OAuth 访问令牌，不接受也不返回快捷指令 Token；
 - 所有偷开事件先写入 Netlify Blobs，再尝试发送 Bark；
 - `.env`、Netlify 本地状态、依赖目录和生成物默认被 Git 忽略；

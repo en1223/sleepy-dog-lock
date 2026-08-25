@@ -1,4 +1,5 @@
 import { getStore, type Store } from "@netlify/blobs";
+import { applyEvent, type GuardState } from "./sleep-guard-event.mts";
 
 const MCP_PROTOCOL_VERSIONS = new Set(["2025-06-18", "2025-03-26"]);
 const DEFAULT_MCP_PROTOCOL_VERSION = "2025-03-26";
@@ -22,11 +23,11 @@ type AuthorizationRequest = {
   state: string;
   scope: string;
   code_challenge: string;
-  approval_token_hash: string;
-  status: "pending" | "approved" | "completed";
+  resource: string;
+  failed_attempts: number;
+  status: "pending" | "completed" | "denied";
   created_at: string;
   expires_at: string;
-  approved_at?: string;
   redirect_url?: string;
 };
 
@@ -35,6 +36,7 @@ type AuthorizationCode = {
   redirect_uri: string;
   scope: string;
   code_challenge: string;
+  resource: string;
   created_at: string;
   expires_at: string;
   used: boolean;
@@ -43,6 +45,7 @@ type AuthorizationCode = {
 type AccessToken = {
   client_id: string;
   scope: string;
+  resource: string;
   created_at: string;
   expires_at: string;
 };
@@ -81,7 +84,7 @@ function html(status: number, body: string): Response {
     headers: {
       "content-type": "text/html; charset=utf-8",
       "cache-control": "no-store",
-      "content-security-policy": "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; img-src 'self'; base-uri 'none'; frame-ancestors 'none'",
+      "content-security-policy": "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
       "referrer-policy": "no-referrer",
       "x-content-type-options": "nosniff",
     },
@@ -127,6 +130,10 @@ function origin(request: Request): string {
   return new URL(request.url).origin;
 }
 
+function mcpResource(request: Request): string {
+  return `${origin(request)}/mcp`;
+}
+
 function isAllowedRedirectUri(value: unknown): value is string {
   if (typeof value !== "string" || value.length > 2048) return false;
   try {
@@ -142,7 +149,7 @@ function isAllowedRedirectUri(value: unknown): value is string {
 function protectedResourceMetadata(request: Request): Response {
   const base = origin(request);
   return json(200, {
-    resource: `${base}/mcp`,
+    resource: mcpResource(request),
     authorization_servers: [base],
     bearer_methods_supported: ["header"],
     scopes_supported: [WRITE_SCOPE],
@@ -203,34 +210,21 @@ export async function registerClient(request: Request, store: Store): Promise<Re
   });
 }
 
-async function sendApprovalBark(approvalUrl: string, clientName: string): Promise<boolean> {
-  const barkKey = Netlify.env.get("BARK_DEVICE_KEY");
-  const barkOrigin = Netlify.env.get("BARK_API_ORIGIN") ?? "https://api.day.app";
-  const barkIcon = Netlify.env.get("BARK_ICON_URL")
-    ?? new URL("/assets/c-avatar-v4.png", approvalUrl).href;
-  if (!barkKey) return false;
+async function secretsMatch(provided: string, expected: string): Promise<boolean> {
+  if (!provided || !expected) return false;
+  const [providedDigest, expectedDigest] = await Promise.all([digest(provided), digest(expected)]);
+  return providedDigest === expectedDigest;
+}
 
-  try {
-    const response = await fetch(`${barkOrigin.replace(/\/$/, "")}/push`, {
-      method: "POST",
-      headers: { "content-type": "application/json; charset=utf-8" },
-      body: JSON.stringify({
-        device_key: barkKey,
-        title: "C",
-        body: `${clientName || "ChatGPT"} 请求连接睡眠守卫。只有刚刚是你操作的，才点这里允许。`,
-        group: "sleep-guard-auth",
-        level: "timeSensitive",
-        icon: barkIcon,
-        url: approvalUrl,
-      }),
-      signal: AbortSignal.timeout(8_000),
-    });
-    if (!response.ok) return false;
-    const body = await response.clone().json().catch(() => ({})) as { code?: number };
-    return body.code === undefined || body.code === 200;
-  } catch {
-    return false;
-  }
+function authorizationPage(requestId: string, clientName: string, error = ""): Response {
+  const safeRequestId = escapeHtml(requestId);
+  const safeClientName = escapeHtml(clientName || "ChatGPT");
+  const errorMarkup = error ? `<p class="error">${escapeHtml(error)}</p>` : "";
+  return html(error ? 403 : 200, `<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Sleepy Dog Lock · 授权</title><style>
+:root{color-scheme:dark}*{box-sizing:border-box}body{margin:0;min-height:100vh;display:grid;place-items:center;background:#111016;color:#f7f4ff;font-family:-apple-system,BlinkMacSystemFont,"SF Pro Display",sans-serif}.card{width:min(88vw,420px);padding:34px;border:1px solid #ffffff26;border-radius:30px;background:linear-gradient(145deg,#ffffff18,#ffffff08);box-shadow:0 30px 90px #0008;text-align:center}.mark{font-size:42px;margin-bottom:16px}.muted{color:#c7c0d4;line-height:1.55}.error{color:#ff9fae}.field{width:100%;margin:12px 0;padding:14px 16px;border:1px solid #ffffff35;border-radius:14px;background:#09080d;color:#fff;font-size:16px}.button{width:100%;padding:14px 18px;border:0;border-radius:14px;background:#9d7cff;color:#fff;font-size:16px;font-weight:700}
+</style></head><body><main class="card"><div class="mark">🌙</div><h1>允许 ChatGPT 连接？</h1><p class="muted">输入你在 Netlify 中设置的授权密码，以允许 ${safeClientName} 使用睡眠状态工具。</p>${errorMarkup}<form method="post" action="/oauth/approve"><input type="hidden" name="id" value="${safeRequestId}"><input class="field" type="password" name="password" minlength="16" maxlength="256" autocomplete="current-password" placeholder="授权密码" required autofocus><button class="button" type="submit">允许连接</button></form></main></body></html>`);
 }
 
 function oauthErrorRedirect(redirectUri: string, state: string, error: string): Response {
@@ -243,7 +237,6 @@ function oauthErrorRedirect(redirectUri: string, state: string, error: string): 
 export async function beginAuthorization(
   request: Request,
   store: Store,
-  sendApproval: (approvalUrl: string, clientName: string) => Promise<boolean> = sendApprovalBark,
 ): Promise<Response> {
   if (request.method !== "GET") return oauthJson(405, { error: "method_not_allowed" });
   const url = new URL(request.url);
@@ -254,23 +247,25 @@ export async function beginAuthorization(
   const scope = url.searchParams.get("scope") || WRITE_SCOPE;
   const challenge = url.searchParams.get("code_challenge") ?? "";
   const challengeMethod = url.searchParams.get("code_challenge_method");
+  const resource = url.searchParams.get("resource") || mcpResource(request);
 
   const client = await loadJson<OAuthClient>(store, `clients/${clientId}`);
   if (!client || !client.redirect_uris.includes(redirectUri)) {
     return oauthJson(400, { error: "invalid_request", error_description: "Unknown client or redirect URI" });
   }
-  if (responseType !== "code" || !state || scope !== WRITE_SCOPE || challengeMethod !== "S256" || challenge.length < 43) {
+  if (
+    responseType !== "code"
+    || !state
+    || scope !== WRITE_SCOPE
+    || challengeMethod !== "S256"
+    || challenge.length < 43
+    || resource !== mcpResource(request)
+  ) {
     return oauthErrorRedirect(redirectUri, state, "invalid_request");
   }
 
   const now = new Date();
-  const lastApproval = await loadJson<{ sent_at?: string }>(store, "throttle/last-approval");
-  if (lastApproval?.sent_at && Date.parse(lastApproval.sent_at) > now.getTime() - 20_000) {
-    return oauthErrorRedirect(redirectUri, state, "temporarily_unavailable");
-  }
-  await store.setJSON("throttle/last-approval", { sent_at: now.toISOString() });
   const requestId = randomToken(24);
-  const approvalToken = randomToken(32);
   const authRequest: AuthorizationRequest = {
     id: requestId,
     client_id: clientId,
@@ -278,69 +273,24 @@ export async function beginAuthorization(
     state,
     scope,
     code_challenge: challenge,
-    approval_token_hash: await digest(approvalToken),
+    resource,
+    failed_attempts: 0,
     status: "pending",
     created_at: now.toISOString(),
     expires_at: new Date(now.getTime() + AUTH_REQUEST_TTL_MS).toISOString(),
   };
   await store.setJSON(`requests/${requestId}`, authRequest);
-
-  const approvalUrl = new URL("/oauth/approve", origin(request));
-  approvalUrl.searchParams.set("id", requestId);
-  approvalUrl.searchParams.set("token", approvalToken);
-  if (!await sendApproval(String(approvalUrl), client.client_name)) {
-    return oauthErrorRedirect(redirectUri, state, "temporarily_unavailable");
-  }
-
-  const safeClientName = escapeHtml(client.client_name || "ChatGPT");
-  const requestIdJson = JSON.stringify(requestId);
-  return html(200, `<!doctype html>
-<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>C · Sleepy Dog Lock</title><style>
-:root{color-scheme:dark}body{margin:0;min-height:100vh;display:grid;place-items:center;background:#111016;color:#f7f4ff;font-family:-apple-system,BlinkMacSystemFont,"SF Pro Display",sans-serif}.card{width:min(86vw,420px);padding:34px;border:1px solid #ffffff26;border-radius:30px;background:linear-gradient(145deg,#ffffff18,#ffffff08);box-shadow:0 30px 90px #0008;backdrop-filter:blur(22px);text-align:center}.mark{font-size:42px;margin-bottom:16px}.muted{color:#c7c0d4;line-height:1.55}.pulse{display:inline-block;width:9px;height:9px;border-radius:50%;background:#9d7cff;box-shadow:0 0 18px #9d7cff;margin-right:8px;animation:p 1.5s infinite}@keyframes p{50%{opacity:.35}}
-</style></head><body><main class="card"><div class="mark">C</div><h1>等你点一下允许</h1><p class="muted"><span class="pulse"></span>授权通知已经发到 Bark。确认是你刚刚连接的 ${safeClientName}，再点通知。</p><p id="status" class="muted">正在等待手机确认……</p></main><script>
-const id=${requestIdJson};let stopped=false;async function poll(){if(stopped)return;try{const r=await fetch('/oauth/pending?id='+encodeURIComponent(id),{cache:'no-store'});const d=await r.json();if(d.redirect){stopped=true;location.replace(d.redirect);return}if(d.error){stopped=true;document.getElementById('status').textContent='授权已失效，请返回重试。';return}}catch{}setTimeout(poll,1200)}poll();
-</script></body></html>`);
+  return authorizationPage(requestId, client.client_name);
 }
 
-export async function approveAuthorization(request: Request, store: Store): Promise<Response> {
-  if (request.method !== "GET") return oauthJson(405, { error: "method_not_allowed" });
-  const url = new URL(request.url);
-  const id = url.searchParams.get("id") ?? "";
-  const token = url.searchParams.get("token") ?? "";
-  const authRequest = await loadJson<AuthorizationRequest>(store, `requests/${id}`);
-  if (!authRequest || authRequest.status !== "pending" || Date.parse(authRequest.expires_at) <= Date.now()) {
-    return html(400, "<!doctype html><meta charset=\"utf-8\"><title>C</title><p>这个授权已经失效，请回到 ChatGPT 重新连接。</p>");
-  }
-  if (!token || await digest(token) !== authRequest.approval_token_hash) {
-    return html(403, "<!doctype html><meta charset=\"utf-8\"><title>C</title><p>授权链接无效。</p>");
-  }
-
-  await store.setJSON(`requests/${id}`, {
-    ...authRequest,
-    status: "approved",
-    approved_at: new Date().toISOString(),
-  });
-  return html(200, `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>C · 已允许</title><style>:root{color-scheme:dark}body{margin:0;min-height:100vh;display:grid;place-items:center;background:#111016;color:#fff;font-family:-apple-system,sans-serif}.card{margin:24px;padding:34px;border:1px solid #ffffff26;border-radius:28px;background:#ffffff10;text-align:center}p{color:#cbc4d6;line-height:1.55}</style></head><body><main class="card"><h1>允许了。</h1><p>回到刚才的 ChatGPT 连接页面，它会自动完成。</p></main></body></html>`);
-}
-
-export async function authorizationStatus(request: Request, store: Store): Promise<Response> {
-  if (request.method !== "GET") return oauthJson(405, { error: "method_not_allowed" });
-  const id = new URL(request.url).searchParams.get("id") ?? "";
-  const authRequest = await loadJson<AuthorizationRequest>(store, `requests/${id}`);
-  if (!authRequest || Date.parse(authRequest.expires_at) <= Date.now()) {
-    return oauthJson(410, { error: "expired" });
-  }
-  if (authRequest.status === "pending") return oauthJson(200, { pending: true });
-  if (authRequest.redirect_url) return oauthJson(200, { redirect: authRequest.redirect_url });
-  if (authRequest.status !== "approved") return oauthJson(409, { error: "invalid_state" });
-
+async function issueAuthorizationCode(authRequest: AuthorizationRequest, store: Store): Promise<string> {
   const code = randomToken(32);
   const codeRecord: AuthorizationCode = {
     client_id: authRequest.client_id,
     redirect_uri: authRequest.redirect_uri,
     scope: authRequest.scope,
     code_challenge: authRequest.code_challenge,
+    resource: authRequest.resource,
     created_at: new Date().toISOString(),
     expires_at: new Date(Date.now() + AUTH_CODE_TTL_MS).toISOString(),
     used: false,
@@ -350,8 +300,43 @@ export async function authorizationStatus(request: Request, store: Store): Promi
   redirect.searchParams.set("code", code);
   redirect.searchParams.set("state", authRequest.state);
   const redirectUrl = String(redirect);
-  await store.setJSON(`requests/${id}`, { ...authRequest, status: "completed", redirect_url: redirectUrl });
-  return oauthJson(200, { redirect: redirectUrl });
+  await store.setJSON(`requests/${authRequest.id}`, {
+    ...authRequest,
+    status: "completed",
+    redirect_url: redirectUrl,
+  });
+  return redirectUrl;
+}
+
+export async function approveAuthorization(request: Request, store: Store): Promise<Response> {
+  if (request.method !== "POST") return oauthJson(405, { error: "method_not_allowed" });
+  const form = new URLSearchParams(await request.text());
+  const id = form.get("id") ?? "";
+  const password = form.get("password") ?? "";
+  const authRequest = await loadJson<AuthorizationRequest>(store, `requests/${id}`);
+  if (!authRequest || authRequest.status !== "pending" || Date.parse(authRequest.expires_at) <= Date.now()) {
+    return html(400, "<!doctype html><meta charset=\"utf-8\"><title>Sleepy Dog Lock</title><p>这个授权已经失效，请回到 ChatGPT 重新连接。</p>");
+  }
+
+  const configuredPassword = Netlify.env.get("MCP_APPROVAL_PASSWORD") ?? "";
+  if (configuredPassword.length < 16) {
+    return html(503, "<!doctype html><meta charset=\"utf-8\"><title>Sleepy Dog Lock</title><p>服务器尚未设置 MCP_APPROVAL_PASSWORD。</p>");
+  }
+  if (!await secretsMatch(password, configuredPassword)) {
+    const failedAttempts = authRequest.failed_attempts + 1;
+    await store.setJSON(`requests/${id}`, {
+      ...authRequest,
+      failed_attempts: failedAttempts,
+      status: failedAttempts >= 5 ? "denied" : "pending",
+    });
+    return authorizationPage(
+      id,
+      "ChatGPT",
+      failedAttempts >= 5 ? "尝试次数过多，请回到 ChatGPT 重新连接。" : "密码不对，再试一次。",
+    );
+  }
+
+  return Response.redirect(await issueAuthorizationCode(authRequest, store), 302);
 }
 
 export async function exchangeToken(request: Request, store: Store): Promise<Response> {
@@ -371,7 +356,13 @@ export async function exchangeToken(request: Request, store: Store): Promise<Res
   if (!record || record.used || Date.parse(record.expires_at) <= Date.now()) {
     return oauthJson(400, { error: "invalid_grant" });
   }
-  if (record.client_id !== clientId || record.redirect_uri !== redirectUri || await digest(verifier) !== record.code_challenge) {
+  const resource = form.get("resource") || record.resource;
+  if (
+    record.client_id !== clientId
+    || record.redirect_uri !== redirectUri
+    || resource !== record.resource
+    || await digest(verifier) !== record.code_challenge
+  ) {
     return oauthJson(400, { error: "invalid_grant" });
   }
 
@@ -380,6 +371,7 @@ export async function exchangeToken(request: Request, store: Store): Promise<Res
   const tokenRecord: AccessToken = {
     client_id: clientId,
     scope: record.scope,
+    resource: record.resource,
     created_at: new Date().toISOString(),
     expires_at: new Date(Date.now() + ACCESS_TOKEN_TTL_SECONDS * 1000).toISOString(),
   };
@@ -396,7 +388,12 @@ export async function hasValidAccessToken(request: Request, store: Store): Promi
   const token = bearerToken(request);
   if (!token) return false;
   const record = await loadJson<AccessToken>(store, `tokens/${await digest(token)}`);
-  return Boolean(record && record.scope === WRITE_SCOPE && Date.parse(record.expires_at) > Date.now());
+  return Boolean(
+    record
+    && record.scope === WRITE_SCOPE
+    && record.resource === mcpResource(request)
+    && Date.parse(record.expires_at) > Date.now()
+  );
 }
 
 function unauthorizedMcp(request: Request): Response {
@@ -480,7 +477,7 @@ async function handleRpc(message: JsonObject, dependencies: McpDependencies): Pr
         });
       }
       return rpcResult(id, {
-        content: [{ type: "text", text: "Sleepy Dog Lock is active. Bark confirmation was sent. Opening a selected entertainment app will trigger the iPhone lock-screen automation." }],
+        content: [{ type: "text", text: "Sleepy Dog Lock is active. The bedtime state was recorded and will expire automatically." }],
         structuredContent: result,
       });
     }
@@ -534,32 +531,54 @@ export async function handleMcp(
   return output ? json(200, output) : new Response(null, { status: 202 });
 }
 
-async function productionDependencies(request: Request): Promise<McpDependencies> {
+export async function activateGuardInStore(eventStore: Store): Promise<GuardResult> {
+  const receivedAt = new Date().toISOString();
+  try {
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      const current = await eventStore.getWithMetadata("state/current", { type: "json" });
+      const transition = applyEvent(current?.data as GuardState | null, {
+        event: "sleep_guard_started",
+        source: "chatgpt_mcp",
+        request_id: crypto.randomUUID(),
+      }, receivedAt);
+      const result = current?.etag
+        ? await eventStore.setJSON("state/current", transition.state, { onlyIfMatch: current.etag })
+        : await eventStore.setJSON("state/current", transition.state, { onlyIfNew: true });
+      if (!result.modified) continue;
+
+      const eventId = crypto.randomUUID();
+      await eventStore.setJSON(`events/${receivedAt.slice(0, 10)}/${receivedAt}-${eventId}`, {
+        id: eventId,
+        request_id: null,
+        event: "sleep_guard_started",
+        attempts: transition.state.attempts,
+        active: transition.state.active,
+        stage: transition.stage,
+        ignored: transition.ignored,
+        auto_started: transition.auto_started,
+        app_name: null,
+        source: "chatgpt_mcp",
+        session_id: transition.state.session_id,
+        received_at: receivedAt,
+      });
+      return {
+        ok: true,
+        active: transition.state.active,
+        attempts: transition.state.attempts,
+        stage: transition.stage,
+        session_id: transition.state.session_id,
+      };
+    }
+    return { ok: false, error: "state_update_conflict" };
+  } catch {
+    return { ok: false, error: "state_update_failed" };
+  }
+}
+
+async function productionDependencies(): Promise<McpDependencies> {
   const eventStore = getStore({ name: "sleep-guard-events", consistency: "strong" });
   return {
-    activateGuard: async () => {
-      const token = Netlify.env.get("SLEEP_GUARD_SHORTCUT_TOKEN");
-      if (!token) return { ok: false, error: "guard_not_configured" };
-      try {
-        const response = await fetch(new URL("/api/sleep-guard-event", request.url), {
-          method: "POST",
-          headers: {
-            authorization: `Bearer ${token}`,
-            "content-type": "application/json; charset=utf-8",
-          },
-          body: JSON.stringify({
-            event: "sleep_guard_started",
-            source: "chatgpt_mcp",
-            request_id: crypto.randomUUID(),
-          }),
-          signal: AbortSignal.timeout(12_000),
-        });
-        const result = await response.json().catch(() => ({ ok: false, error: "invalid_guard_response" })) as GuardResult;
-        return response.ok ? result : { ok: false, error: result.error ?? "guard_request_failed" };
-      } catch {
-        return { ok: false, error: "guard_request_failed" };
-      }
-    },
+    activateGuard: async () => await activateGuardInStore(eventStore),
     readGuardState: async () => await eventStore.get("state/current", { type: "json" }) as JsonObject | null,
   };
 }
@@ -575,10 +594,9 @@ export default async (request: Request): Promise<Response> => {
   if (pathname === "/oauth/register") return registerClient(request, authStore);
   if (pathname === "/oauth/authorize") return beginAuthorization(request, authStore);
   if (pathname === "/oauth/approve") return approveAuthorization(request, authStore);
-  if (pathname === "/oauth/pending") return authorizationStatus(request, authStore);
   if (pathname === "/oauth/token") return exchangeToken(request, authStore);
   if (pathname === "/mcp") {
-    return handleMcp(request, await productionDependencies(request), await hasValidAccessToken(request, authStore));
+    return handleMcp(request, await productionDependencies(), await hasValidAccessToken(request, authStore));
   }
   return json(404, { error: "not_found" });
 };
@@ -591,7 +609,6 @@ export const config = {
     "/.well-known/oauth-authorization-server",
     "/oauth/register",
     "/oauth/authorize",
-    "/oauth/pending",
     "/oauth/approve",
     "/oauth/token",
   ],
