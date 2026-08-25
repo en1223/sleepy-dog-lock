@@ -50,7 +50,7 @@ for (const path of sourceFiles) {
   const contents = await readFile(path, "utf8");
   assert.doesNotMatch(
     contents,
-    /(?:BARK_DEVICE_KEY|SLEEP_GUARD_SHORTCUT_TOKEN)\s*=\s*(?!replace-with)[A-Za-z0-9_-]{12,}/,
+    /(?:BARK_DEVICE_KEY|SLEEP_GUARD_SHORTCUT_TOKEN|MCP_APPROVAL_PASSWORD)\s*=\s*(?!replace-with)[A-Za-z0-9_-]{12,}/,
     `possible committed secret in ${relative(rootPath, path)}`,
   );
 }
@@ -59,6 +59,7 @@ const environment = new Map([
   ["SLEEP_GUARD_SHORTCUT_TOKEN", "test-shortcut-token"],
   ["BARK_DEVICE_KEY", "test-bark-key"],
   ["BARK_API_ORIGIN", "https://api.day.app"],
+  ["MCP_APPROVAL_PASSWORD", "correct-horse-battery-staple"],
 ]);
 globalThis.Netlify = { env: { get: (key) => environment.get(key) } };
 
@@ -300,14 +301,36 @@ const barkFailure = await functionModule.handle(request({ event: "sleep_guard_st
 assert.equal(barkFailure.status, 502);
 assert.equal(persistedBeforeBarkFailure, true);
 
+environment.delete("BARK_DEVICE_KEY");
+let barkCalledWithoutKey = false;
+const noBarkConfigured = await functionModule.handle(request({ event: "sleep_guard_started" }), {
+  transitionState: async (payload, receivedAt) => functionModule.applyEvent(null, payload, receivedAt),
+  persistEvent: async () => {},
+  sendBark: async () => { barkCalledWithoutKey = true; return new Response("ok"); },
+});
+assert.equal(noBarkConfigured.status, 200);
+assert.equal(barkCalledWithoutKey, false);
+environment.set("BARK_DEVICE_KEY", "test-bark-key");
+
 const mcpModule = await import(new URL("netlify/netlify/functions/mcp.mts", root));
 assert.ok(mcpModule.config.path.includes("/mcp"));
 assert.ok(mcpModule.config.path.includes("/.well-known/oauth-authorization-server"));
 
 class MemoryStore {
   values = new Map();
+  etags = new Map();
   async get(key) { return this.values.get(key) ?? null; }
-  async setJSON(key, value) { this.values.set(key, structuredClone(value)); return { modified: true }; }
+  async getWithMetadata(key) {
+    if (!this.values.has(key)) return null;
+    return { data: structuredClone(this.values.get(key)), etag: String(this.etags.get(key)) };
+  }
+  async setJSON(key, value, options = {}) {
+    if (options.onlyIfNew && this.values.has(key)) return { modified: false };
+    if (options.onlyIfMatch && String(this.etags.get(key)) !== options.onlyIfMatch) return { modified: false };
+    this.values.set(key, structuredClone(value));
+    this.etags.set(key, (this.etags.get(key) ?? 0) + 1);
+    return { modified: true };
+  }
 }
 
 const authStore = new MemoryStore();
@@ -334,26 +357,29 @@ authorizeUrl.searchParams.set("state", "state-123");
 authorizeUrl.searchParams.set("scope", "sleep_guard:write");
 authorizeUrl.searchParams.set("code_challenge", challenge);
 authorizeUrl.searchParams.set("code_challenge_method", "S256");
-let approvalUrl;
-const authorization = await mcpModule.beginAuthorization(
-  new Request(authorizeUrl),
-  authStore,
-  async (url, clientName) => { approvalUrl = url; assert.equal(clientName, "ChatGPT"); return true; },
-);
+authorizeUrl.searchParams.set("resource", "https://guard.test/mcp");
+const authorization = await mcpModule.beginAuthorization(new Request(authorizeUrl), authStore);
 assert.equal(authorization.status, 200);
-assert.ok(approvalUrl);
+const authorizationHtml = await authorization.text();
+assert.match(authorizationHtml, /name="password"/);
+const approvalRequestId = authorizationHtml.match(/name="id" value="([^"]+)"/)?.[1];
+assert.ok(approvalRequestId);
 
-const approval = await mcpModule.approveAuthorization(new Request(approvalUrl), authStore);
-assert.equal(approval.status, 200);
-const approvalRequestId = new URL(approvalUrl).searchParams.get("id");
-const pending = await mcpModule.authorizationStatus(
-  new Request(`https://guard.test/oauth/pending?id=${encodeURIComponent(approvalRequestId)}`),
+const approvalRequest = (password) => new Request("https://guard.test/oauth/approve", {
+  method: "POST",
+  headers: { "content-type": "application/x-www-form-urlencoded" },
+  body: new URLSearchParams({ id: approvalRequestId, password }),
+});
+const wrongPassword = await mcpModule.approveAuthorization(approvalRequest("wrong-password"), authStore);
+assert.equal(wrongPassword.status, 403);
+assert.match(await wrongPassword.text(), /密码不对/);
+
+const approval = await mcpModule.approveAuthorization(
+  approvalRequest("correct-horse-battery-staple"),
   authStore,
 );
-assert.equal(pending.status, 200);
-const pendingBody = await pending.json();
-assert.ok(pendingBody.redirect);
-const oauthRedirect = new URL(pendingBody.redirect);
+assert.equal(approval.status, 302);
+const oauthRedirect = new URL(approval.headers.get("location"));
 assert.equal(oauthRedirect.searchParams.get("state"), "state-123");
 const authorizationCode = oauthRedirect.searchParams.get("code");
 assert.ok(authorizationCode);
@@ -364,6 +390,7 @@ const tokenForm = new URLSearchParams({
   client_id: registeredClient.client_id,
   redirect_uri: registeredClient.redirect_uris[0],
   code_verifier: verifier,
+  resource: "https://guard.test/mcp",
 });
 const tokenResponse = await mcpModule.exchangeToken(new Request("https://guard.test/oauth/token", {
   method: "POST",
@@ -377,6 +404,9 @@ assert.ok(tokenBody.access_token);
 assert.equal(await mcpModule.hasValidAccessToken(new Request("https://guard.test/mcp", {
   headers: { authorization: `Bearer ${tokenBody.access_token}` },
 }), authStore), true);
+assert.equal(await mcpModule.hasValidAccessToken(new Request("https://other.test/mcp", {
+  headers: { authorization: `Bearer ${tokenBody.access_token}` },
+}), authStore), false);
 
 const replayedCode = await mcpModule.exchangeToken(new Request("https://guard.test/oauth/token", {
   method: "POST",
@@ -384,6 +414,14 @@ const replayedCode = await mcpModule.exchangeToken(new Request("https://guard.te
 }), authStore);
 assert.equal(replayedCode.status, 400);
 assert.equal((await replayedCode.json()).error, "invalid_grant");
+
+const eventStore = new MemoryStore();
+const directActivation = await mcpModule.activateGuardInStore(eventStore);
+assert.equal(directActivation.ok, true);
+assert.equal(directActivation.active, true);
+assert.equal(directActivation.stage, "armed");
+assert.equal((await eventStore.get("state/current")).active, true);
+assert.ok([...eventStore.values.keys()].some((key) => key.startsWith("events/")));
 
 let mcpActivations = 0;
 const mcpDependencies = {
@@ -417,5 +455,5 @@ assert.equal(activatedMcpBody.result.structuredContent.active, true);
 assert.equal(mcpActivations, 1);
 
 console.log(
-  `verify passed: ${sourceFiles.length} files, guard state/API, OAuth PKCE/replay protection, MCP auth/tools, durable event before Bark`,
+  `verify passed: ${sourceFiles.length} files, guard state/API, optional Bark, password OAuth PKCE/resource binding, MCP auth/tools`,
 );
